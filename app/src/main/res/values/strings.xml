@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">SecureBank</string>
+    <string name="bank_title">SecureBank</string>
+    <string name="account_masked">Account •••• %1$s</string>
+    <string name="balance_label">Balance: %1$s</string>
+    <string name="router_subtitle">Payment Router Ready</string>
+    <string name="send_sample_transfer">Send $100 wire transfer</string>
+    <string name="recent_transfers_title">Recent wire transfers</string>
+    <string name="no_recent_transfers">No wire transfers executed</string>
+    <string name="transfer_item">-%1$s to %2$s</string>
+    <string name="transfer_completed">Transferred %1$s to %2$s</string>
+</resources>

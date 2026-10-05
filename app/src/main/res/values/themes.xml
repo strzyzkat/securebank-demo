@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.SecureBank" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
