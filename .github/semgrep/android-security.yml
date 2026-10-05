@@ -1,0 +1,61 @@
+rules:
+  - id: android-intent-redirection-cwe-940
+    languages: [kotlin, java]
+    severity: ERROR
+    message: >-
+      Potential Android Intent Redirection (CWE-940): A nested Intent is extracted
+      from incoming extras and passed to a component launch method. Verify that the
+      resolved target is exported and does not belong to an internal package.
+    metadata:
+      cwe: "CWE-940"
+      guard_id: "intent-redirection"
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              fun $FUNC(...): $RET {
+                ...
+              }
+          - pattern-either:
+              - pattern: IntentCompat.getParcelableExtra(...)
+              - pattern: $INTENT.getParcelableExtra(...)
+          - pattern-inside: |
+              ...
+              startActivity($TARGET)
+      - pattern: |
+          val $REDIRECT = $INCOMING?.let {
+            IntentCompat.getParcelableExtra(it, $KEY, Intent::class.java)
+          }
+          ...
+          if ($REDIRECT != null) {
+            ...
+            startActivity($REDIRECT)
+            ...
+          }
+      - pattern: |
+          Intent $REDIRECT = $INCOMING.getParcelableExtra($KEY);
+          ...
+          startActivity($REDIRECT);
+
+  - id: android-mutable-pending-intent-cwe-927
+    languages: [kotlin, java]
+    severity: WARNING
+    message: >-
+      PendingIntent created with FLAG_MUTABLE (CWE-927). Prefer FLAG_IMMUTABLE or
+      ensure the wrapped Intent explicitly sets a target component.
+    metadata:
+      cwe: "CWE-927"
+      guard_id: "pending-intent-mutability"
+    pattern: PendingIntent.FLAG_MUTABLE
+
+  - id: android-webview-js-bridge-cwe-749
+    languages: [kotlin, java]
+    severity: ERROR
+    message: >-
+      WebView exposes a JavaScript interface or enables universal file access (CWE-749).
+    metadata:
+      cwe: "CWE-749"
+      guard_id: "insecure-webview-bridge"
+    pattern-either:
+      - pattern: $WEBVIEW.addJavascriptInterface(...)
+      - pattern: $SETTINGS.allowUniversalAccessFromFileURLs = true
+      - pattern: $SETTINGS.setAllowUniversalAccessFromFileURLs(true)

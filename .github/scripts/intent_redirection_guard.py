@@ -2,9 +2,9 @@
 """
 Extensible AI Security Gate & Auto-Patcher for Android Pull Requests.
 
-Evaluates PR diffs and project context against a registry of Android security guards,
-compiles and verifies AI-generated patches with Gradle, commits the fix directly to
-the PR branch, and posts a detailed root-cause and diff explanation on the PR.
+Combines a fast static Semgrep pre-filter with Google Gemini cross-component analysis,
+verifies AI-generated patches with Gradle, commits the fix directly to the PR branch,
+and posts a detailed root-cause and diff explanation on the PR.
 """
 
 from dataclasses import dataclass
@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 
-GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 MANIFEST_PATH = Path("app/src/main/AndroidManifest.xml")
 AUTO_FIX_COMMIT_PREFIX = "fix(security):"
 
@@ -118,7 +118,7 @@ def get_pr_diff(base_ref: str) -> str:
 
 
 def get_project_source_files(base_ref: str) -> dict[str, str]:
-    """Return modified files plus all app source files for cross-component analysis."""
+    """Return all app source files when any source or manifest file in app/src/main changed."""
     diff_res = run_cmd(["git", "diff", "--name-only", f"origin/{base_ref}...HEAD"], check=False)
     changed_paths = {
         Path(line.strip())
@@ -126,11 +126,11 @@ def get_project_source_files(base_ref: str) -> dict[str, str]:
         if line.strip()
     }
 
-    relevant_Changed = [
+    relevant_changed = [
         p for p in changed_paths
         if p.exists() and p.suffix in {".kt", ".java", ".xml"} and "app/src/main" in str(p)
     ]
-    if not relevant_Changed:
+    if not relevant_changed:
         return {}
 
     all_app_sources: dict[str, str] = {}
@@ -139,6 +139,34 @@ def get_project_source_files(base_ref: str) -> dict[str, str]:
             all_app_sources[str(root_file)] = root_file.read_text(encoding="utf-8")
 
     return all_app_sources
+
+
+def load_semgrep_prefilter_summary(semgrep_path_str: str) -> str:
+    """Parse Semgrep JSON output into a concise summary of flagged locations for the LLM."""
+    path = Path(semgrep_path_str) if semgrep_path_str else None
+    if not path or not path.exists():
+        return "Semgrep pre-filter file not provided."
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return f"Unable to parse Semgrep output: {exc}"
+
+    results = raw.get("results", [])
+    if not results:
+        return "No static findings flagged by Semgrep pre-filter (perform full semantic analysis on diff and manifest)."
+
+    lines = []
+    for item in results:
+        check_id = item.get("check_id", "unknown-rule")
+        file_path = item.get("path", "")
+        start_line = item.get("start", {}).get("line", "?")
+        end_line = item.get("end", {}).get("line", "?")
+        message = item.get("extra", {}).get("message", "")
+        lines.append(
+            f"- Rule `{check_id}` at `{file_path}:{start_line}-{end_line}`: {message}"
+        )
+    return "\n".join(lines)
 
 
 def build_guards_prompt_section(guards: list[SecurityGuard]) -> str:
@@ -156,6 +184,7 @@ def call_gemini(
     api_key: str,
     manifest_xml: str,
     pr_diff: str,
+    semgrep_summary: str,
     source_files: dict[str, str],
     guards: list[SecurityGuard],
 ) -> dict:
@@ -167,13 +196,13 @@ def call_gemini(
     guards_section = build_guards_prompt_section(guards)
 
     prompt = f"""You are an automated Android application security gate in a CI/CD pipeline.
-Evaluate the Pull Request diff alongside AndroidManifest.xml and the application source files against the registered security guards below.
+Evaluate the Pull Request diff alongside the Semgrep static pre-filter signals, AndroidManifest.xml, and the application source files against the registered security guards below.
 
 === REGISTERED SECURITY GUARDS ===
 {guards_section}
 
 === INSTRUCTIONS ===
-1. Correlate the PR diff with AndroidManifest.xml and all application source files. Look at how exported components interact with non-exported components (such as `TransferMoneyActivity`).
+1. Review the Semgrep static pre-filter findings and correlate the PR diff with AndroidManifest.xml and all application source files. Look at how exported components interact with non-exported components (such as `TransferMoneyActivity`).
 2. If one or more guards are violated by the code in this PR:
    - Set `vulnerable` to `true`.
    - Populate `findings` with one entry per violated guard, explaining clearly:
@@ -182,6 +211,9 @@ Evaluate the Pull Request diff alongside AndroidManifest.xml and the application
    - Populate `patched_files` with the complete, compilable file content for every file that needs modification to fix all findings.
    - Preserve all existing package declarations, imports, UI composables, and helper methods so `./gradlew :app:compileDebugKotlin :app:testDebugUnitTest` succeeds without errors.
 3. If no security guard is violated, set `vulnerable` to `false` and return empty arrays for `findings` and `patched_files`.
+
+--- STEP 1: SEMGREP STATIC PRE-FILTER FINDINGS ---
+{semgrep_summary}
 
 --- ANDROID MANIFEST ({MANIFEST_PATH}) ---
 {manifest_xml}
@@ -343,6 +375,7 @@ def main() -> int:
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     pr_number = os.environ.get("PR_NUMBER", "")
     github_token = os.environ.get("GITHUB_TOKEN", "")
+    semgrep_path = os.environ.get("SEMGREP_RESULTS_PATH", "semgrep_raw.json")
 
     pr_diff = get_pr_diff(base_ref)
     source_files = get_project_source_files(base_ref)
@@ -355,13 +388,24 @@ def main() -> int:
             return 1
         return 0
 
+    semgrep_summary = load_semgrep_prefilter_summary(semgrep_path)
+    print("Semgrep pre-filter summary:")
+    print(semgrep_summary)
+
     manifest_xml = MANIFEST_PATH.read_text(encoding="utf-8") if MANIFEST_PATH.exists() else ""
 
     print(
         f"Evaluating PR against {len(SECURITY_GUARDS)} security guards "
         f"across {len(source_files)} source file(s) using {GEMINI_MODEL}..."
     )
-    result = call_gemini(api_key, manifest_xml, pr_diff, source_files, SECURITY_GUARDS)
+    result = call_gemini(
+        api_key,
+        manifest_xml,
+        pr_diff,
+        semgrep_summary,
+        source_files,
+        SECURITY_GUARDS,
+    )
 
     if not result.get("vulnerable", False):
         print("All security guards passed. Verifying build...")

@@ -3,6 +3,10 @@ name: Intent Redirection Security Gate
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    branches: [main, master]
+    paths:
+      - 'app/src/**'
+      - '.github/**'
 
 permissions:
   contents: write
@@ -21,19 +25,40 @@ jobs:
           ref: ${{ github.head_ref }}
           fetch-depth: 0
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Step 1 - Fast Static Pre-Filter (Semgrep)
+        run: |
+          semgrep scan \
+            --config .github/semgrep/android-security.yml \
+            --config p/android \
+            --json \
+            --output semgrep_raw.json \
+            app/src/ || true
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK licenses
+        run: |
+          chmod +x ./gradlew
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Gemini Intent Redirection Guard
+      - name: Step 2 - Run Gemini Security Agent & Auto-Patcher
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -41,4 +66,5 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          SEMGREP_RESULTS_PATH: semgrep_raw.json
         run: python3 .github/scripts/intent_redirection_guard.py
