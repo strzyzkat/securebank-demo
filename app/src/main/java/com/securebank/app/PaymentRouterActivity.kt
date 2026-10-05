@@ -25,6 +25,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.content.IntentCompat
 import java.text.NumberFormat
 import java.util.Currency
 
@@ -34,6 +35,23 @@ class PaymentRouterActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 1. Receive incoming intent from an external app
+        val incomingIntent = intent
+
+        // 2. Extract the nested "redirect" intent from extras
+        val redirectIntent = incomingIntent?.let {
+            IntentCompat.getParcelableExtra(it, EXTRA_ON_SUCCESS_INTENT, Intent::class.java)
+        }
+
+        // VULNERABILITY: Blindly launching the nested intent!
+        // SecureBank acts as a "confused deputy" and launches whatever target is inside.
+        if (redirectIntent != null) {
+            startActivity(redirectIntent)
+            finish()
+            return
+        }
+
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
@@ -62,6 +80,7 @@ class PaymentRouterActivity : ComponentActivity() {
     }
 
     companion object {
+        const val EXTRA_ON_SUCCESS_INTENT = "on_success_intent"
         private const val SAMPLE_RECIPIENT = "SAVINGS-ACCOUNT-001"
         private const val SAMPLE_AMOUNT = 100.00
     }
