@@ -10,14 +10,30 @@ and posts a detailed root-cause and diff explanation on the PR.
 from dataclasses import dataclass
 import json
 import os
+import random
+import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 
-GEMINI_MODEL = "gemini-flash-latest"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+# Models tried in order when the previous model is under high demand or unavailable.
+GEMINI_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-pro-latest,gemini-3.6-flash").split(",")
+    if m.strip()
+]
+GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "4"))
+GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "180"))
+RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+# High demand / quota errors: switch to the next model immediately instead of retrying.
+SWITCH_MODEL_HTTP_CODES = {429, 503}
+# Model not found (e.g. alias unavailable for this key): skip to the next model.
+SKIP_MODEL_HTTP_CODES = {404}
 MANIFEST_PATH = Path("app/src/main/AndroidManifest.xml")
 AUTO_FIX_COMMIT_PREFIX = "fix(security):"
 
@@ -188,8 +204,6 @@ def call_gemini(
     source_files: dict[str, str],
     guards: list[SecurityGuard],
 ) -> dict:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
-
     files_section = "\n\n".join(
         f"--- FILE: {path} ---\n{content}" for path, content in source_files.items()
     )
@@ -279,19 +293,8 @@ Review the Pull Request diff alongside the Semgrep static pre-filter signals, An
         },
     }
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        err_body = exc.read().decode("utf-8", errors="replace")
-        print(f"Gemini API error on model '{GEMINI_MODEL}' (HTTP {exc.code}): {err_body}", file=sys.stderr)
-        raise
+    body, model_used = post_gemini_with_retry(api_key, payload)
+    print(f"Gemini response received from model '{model_used}'.")
 
     candidates = body.get("candidates")
     if not candidates:
@@ -305,6 +308,61 @@ Review the Pull Request diff alongside the Semgrep static pre-filter signals, An
 
     text = parts[0]["text"]
     return json.loads(text)
+
+
+def post_gemini_with_retry(api_key: str, payload: dict) -> tuple[dict, str]:
+    """POST to Gemini, switching models on high demand and retrying other transient errors."""
+    data = json.dumps(payload).encode("utf-8")
+    models = list(dict.fromkeys([GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]))
+    last_exc: Exception | None = None
+
+    for index, model in enumerate(models):
+        is_last_model = index == len(models) - 1
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            retry_after: float | None = None
+            try:
+                with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT_SECONDS) as resp:
+                    return json.loads(resp.read().decode("utf-8")), model
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8", errors="replace")
+                print(
+                    f"Gemini API error on model '{model}' (HTTP {exc.code}, attempt {attempt}/{GEMINI_MAX_ATTEMPTS}): {err_body}",
+                    file=sys.stderr,
+                )
+                last_exc = exc
+                if exc.code in SKIP_MODEL_HTTP_CODES and not is_last_model:
+                    print(f"Model '{model}' not found; switching to '{models[index + 1]}'.", file=sys.stderr)
+                    break
+                if exc.code in SWITCH_MODEL_HTTP_CODES and not is_last_model:
+                    print(f"Model '{model}' under high demand; switching to '{models[index + 1]}'.", file=sys.stderr)
+                    break
+                if exc.code not in RETRYABLE_HTTP_CODES:
+                    raise
+                header = exc.headers.get("Retry-After") if exc.headers else None
+                if header and header.isdigit():
+                    retry_after = float(header)
+            except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as exc:
+                print(
+                    f"Gemini network error on model '{model}' (attempt {attempt}/{GEMINI_MAX_ATTEMPTS}): {exc}",
+                    file=sys.stderr,
+                )
+                last_exc = exc
+
+            if attempt < GEMINI_MAX_ATTEMPTS:
+                delay = retry_after if retry_after is not None else min(60.0, 2 ** attempt) + random.uniform(0, 1)
+                print(f"Retrying in {delay:.1f}s...", file=sys.stderr)
+                time.sleep(delay)
+        else:
+            print(f"Model '{model}' unavailable after {GEMINI_MAX_ATTEMPTS} attempts.", file=sys.stderr)
+
+    raise RuntimeError(f"All Gemini models failed ({', '.join(models)})") from last_exc
 
 
 def verify_gradle_build() -> tuple[bool, str]:
