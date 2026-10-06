@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-flash-latest"
 MANIFEST_PATH = Path("app/src/main/AndroidManifest.xml")
 AUTO_FIX_COMMIT_PREFIX = "fix(security):"
 
@@ -279,8 +279,13 @@ Evaluate the Pull Request diff alongside the Semgrep static pre-filter signals, 
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        print(f"Gemini API error on model '{GEMINI_MODEL}' (HTTP {exc.code}): {err_body}", file=sys.stderr)
+        raise
 
     text = body["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(text)

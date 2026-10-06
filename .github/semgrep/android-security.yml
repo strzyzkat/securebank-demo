@@ -4,37 +4,16 @@ rules:
     severity: ERROR
     message: >-
       Potential Android Intent Redirection (CWE-940): A nested Intent is extracted
-      from incoming extras and passed to a component launch method. Verify that the
-      resolved target is exported and does not belong to an internal package.
+      from incoming extras via getParcelableExtra and passed to startActivity.
+      Verify that the resolved target is exported and does not belong to an internal package.
     metadata:
       cwe: "CWE-940"
       guard_id: "intent-redirection"
     pattern-either:
-      - patterns:
-          - pattern-inside: |
-              fun $FUNC(...): $RET {
-                ...
-              }
-          - pattern-either:
-              - pattern: IntentCompat.getParcelableExtra(...)
-              - pattern: $INTENT.getParcelableExtra(...)
-          - pattern-inside: |
-              ...
-              startActivity($TARGET)
-      - pattern: |
-          val $REDIRECT = $INCOMING?.let {
-            IntentCompat.getParcelableExtra(it, $KEY, Intent::class.java)
-          }
-          ...
-          if ($REDIRECT != null) {
-            ...
-            startActivity($REDIRECT)
-            ...
-          }
-      - pattern: |
-          Intent $REDIRECT = $INCOMING.getParcelableExtra($KEY);
-          ...
-          startActivity($REDIRECT);
+      - pattern: IntentCompat.getParcelableExtra($INTENT, $KEY, Intent::class.java)
+      - pattern: IntentCompat.getParcelableExtra($INTENT, $KEY, $CLASS)
+      - pattern: $INTENT.getParcelableExtra($KEY)
+      - pattern: $INTENT.getParcelableExtra($KEY, Intent::class.java)
 
   - id: android-mutable-pending-intent-cwe-927
     languages: [kotlin, java]
