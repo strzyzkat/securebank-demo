@@ -7,6 +7,8 @@ verifies AI-generated patches with Gradle, commits the fix directly to the PR br
 and posts a detailed root-cause and diff explanation on the PR.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import json
 import os
@@ -29,6 +31,8 @@ GEMINI_FALLBACK_MODELS = [
 ]
 GEMINI_MAX_ATTEMPTS = int(os.environ.get("GEMINI_MAX_ATTEMPTS", "4"))
 GEMINI_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_TIMEOUT_SECONDS", "180"))
+# Times to send compiler errors back to Gemini when a generated patch does not compile.
+GEMINI_PATCH_REPAIR_ATTEMPTS = int(os.environ.get("GEMINI_PATCH_REPAIR_ATTEMPTS", "2"))
 RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 # High demand / quota errors: switch to the next model immediately instead of retrying.
 SWITCH_MODEL_HTTP_CODES = {429, 503}
@@ -224,6 +228,7 @@ Review the Pull Request diff alongside the Semgrep static pre-filter signals, An
      * `how_patched`: How the generated defensive patch validates the target component and neutralizes the risk.
    - Populate `patched_files` with the complete, compilable file content for every file that needs modification to fix all findings.
    - Preserve all existing package declarations, imports, UI composables, and helper methods so `./gradlew :app:compileDebugKotlin :app:testDebugUnitTest` succeeds without errors.
+   - Each `content` value must be the raw source file: real newlines, `package` declaration first, one `import` per line, no markdown code fences, no line numbers.
 3. If no guard is violated, set `vulnerable` to `false` and return empty arrays for `findings` and `patched_files`.
 
 --- STEP 1: SEMGREP STATIC PRE-FILTER FINDINGS ---
@@ -239,6 +244,52 @@ Review the Pull Request diff alongside the Semgrep static pre-filter signals, An
 {files_section}
 """
 
+    return generate_structured(api_key, prompt)
+
+
+RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "vulnerable": {"type": "BOOLEAN"},
+        "findings": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "guard_id": {"type": "STRING"},
+                    "cwe": {"type": "STRING"},
+                    "title": {"type": "STRING"},
+                    "file": {"type": "STRING"},
+                    "why_dangerous": {"type": "STRING"},
+                    "how_patched": {"type": "STRING"},
+                },
+                "required": [
+                    "guard_id",
+                    "cwe",
+                    "title",
+                    "file",
+                    "why_dangerous",
+                    "how_patched",
+                ],
+            },
+        },
+        "patched_files": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "path": {"type": "STRING"},
+                    "content": {"type": "STRING"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    "required": ["vulnerable", "findings", "patched_files"],
+}
+
+
+def generate_structured(api_key: str, prompt: str) -> dict:
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "safetySettings": [
@@ -250,46 +301,7 @@ Review the Pull Request diff alongside the Semgrep static pre-filter signals, An
         "generationConfig": {
             "temperature": 0.1,
             "responseMimeType": "application/json",
-            "responseSchema": {
-                "type": "OBJECT",
-                "properties": {
-                    "vulnerable": {"type": "BOOLEAN"},
-                    "findings": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "guard_id": {"type": "STRING"},
-                                "cwe": {"type": "STRING"},
-                                "title": {"type": "STRING"},
-                                "file": {"type": "STRING"},
-                                "why_dangerous": {"type": "STRING"},
-                                "how_patched": {"type": "STRING"},
-                            },
-                            "required": [
-                                "guard_id",
-                                "cwe",
-                                "title",
-                                "file",
-                                "why_dangerous",
-                                "how_patched",
-                            ],
-                        },
-                    },
-                    "patched_files": {
-                        "type": "ARRAY",
-                        "items": {
-                            "type": "OBJECT",
-                            "properties": {
-                                "path": {"type": "STRING"},
-                                "content": {"type": "STRING"},
-                            },
-                            "required": ["path", "content"],
-                        },
-                    },
-                },
-                "required": ["vulnerable", "findings", "patched_files"],
-            },
+            "responseSchema": RESPONSE_SCHEMA,
         },
     }
 
@@ -301,13 +313,107 @@ Review the Pull Request diff alongside the Semgrep static pre-filter signals, An
         print(f"Unexpected Gemini API response (no candidates): {json.dumps(body, indent=2)}", file=sys.stderr)
         raise RuntimeError(f"Gemini returned no candidates: {body.get('promptFeedback', body)}")
 
+    finish_reason = candidates[0].get("finishReason")
+    if finish_reason and finish_reason != "STOP":
+        print(f"WARNING: Gemini finishReason={finish_reason}; output may be truncated.", file=sys.stderr)
+
     parts = candidates[0].get("content", {}).get("parts", [])
     if not parts or "text" not in parts[0]:
         print(f"Unexpected Gemini candidate structure: {json.dumps(candidates[0], indent=2)}", file=sys.stderr)
-        raise RuntimeError(f"Gemini candidate had no text part (finishReason={candidates[0].get('finishReason')})")
+        raise RuntimeError(f"Gemini candidate had no text part (finishReason={finish_reason})")
 
-    text = parts[0]["text"]
+    text = "".join(p.get("text", "") for p in parts)
     return json.loads(text)
+
+
+def request_patch_repair(
+    api_key: str,
+    findings: list[dict],
+    original_files: dict[str, str],
+    patched_files: list[dict],
+    build_errors: str,
+) -> dict:
+    """Send the failed patch and compiler errors back to Gemini and ask for a corrected patch."""
+    originals_section = "\n\n".join(
+        f"--- ORIGINAL FILE: {path} ---\n{content}" for path, content in original_files.items()
+    )
+    patched_section = "\n\n".join(
+        f"--- FAILED PATCH: {item['path']} ---\n{item['content']}" for item in patched_files
+    )
+    prompt = f"""You are fixing an Android Kotlin security patch that failed to compile.
+
+The previous patch addressed these findings:
+{json.dumps(findings, indent=2)}
+
+Return corrected, complete, compilable file contents in `patched_files`, and repeat the same `findings` with `vulnerable` set to true.
+Rules:
+- Each `content` value must be the raw source file: real newlines, one statement per line, no markdown code fences, no line numbers.
+- Start each Kotlin file with its `package` declaration, followed by one `import` per line.
+- Keep every import, class, composable, and helper from the original file unless the fix requires changing it.
+- Change only what is needed to fix the security findings and the compiler errors.
+
+--- KOTLIN COMPILER ERRORS ---
+{build_errors}
+
+{patched_section}
+
+{originals_section}
+"""
+    return generate_structured(api_key, prompt)
+
+
+def sanitize_patched_content(content: str) -> str:
+    """Remove common LLM output artifacts from generated source files."""
+    text = content.replace("\r\n", "\n")
+    stripped = text.strip()
+    # Strip a surrounding markdown code fence (``` or ```kotlin).
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")
+        lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    # Double-escaped output: literal "\n" sequences instead of real newlines.
+    if text.count("\\n") > text.count("\n"):
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+    return text.rstrip() + "\n"
+
+
+def extract_compiler_errors(build_output: str, limit: int = 60) -> str:
+    errors = [line for line in build_output.splitlines() if line.startswith(("e: ", "error:"))]
+    if not errors:
+        return build_output[-6000:]
+    return "\n".join(errors[:limit])
+
+
+def apply_patched_files(patched_files: list[dict], backups: dict[Path, str | None]) -> list[str]:
+    modified: list[str] = []
+    for item in patched_files:
+        file_path = Path(item["path"])
+        if file_path not in backups:
+            backups[file_path] = file_path.read_text(encoding="utf-8") if file_path.exists() else None
+        item["content"] = sanitize_patched_content(item["content"])
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(item["content"], encoding="utf-8")
+        modified.append(str(file_path))
+    return modified
+
+
+def restore_backups(backups: dict[Path, str | None]) -> None:
+    for file_path, original in backups.items():
+        if original is None:
+            file_path.unlink(missing_ok=True)
+        else:
+            file_path.write_text(original, encoding="utf-8")
+
+
+def print_file_head(path: str, lines: int = 15) -> None:
+    p = Path(path)
+    if not p.exists():
+        return
+    print(f"--- First {lines} lines of generated {path} ---", file=sys.stderr)
+    for idx, line in enumerate(p.read_text(encoding="utf-8").splitlines()[:lines], start=1):
+        print(f"{idx:4}: {line}", file=sys.stderr)
 
 
 def post_gemini_with_retry(api_key: str, payload: dict) -> tuple[dict, str]:
@@ -499,22 +605,44 @@ def main() -> int:
         print(f"[{f['guard_id']}] {f['cwe']} ({f['file']}): {f['why_dangerous']}")
 
     patched_files = result.get("patched_files", [])
-    modified_paths: list[str] = []
-    backups: dict[Path, str] = {}
+    if not patched_files:
+        print("Gemini reported findings but returned no patched files.", file=sys.stderr)
+        return 1
 
-    for item in patched_files:
-        file_path = Path(item["path"])
-        if file_path.exists():
-            backups[file_path] = file_path.read_text(encoding="utf-8")
-        file_path.write_text(item["content"], encoding="utf-8")
-        modified_paths.append(str(file_path))
-
+    backups: dict[Path, str | None] = {}
+    modified_paths = apply_patched_files(patched_files, backups)
     ok, build_output = verify_gradle_build()
+
+    for repair_attempt in range(1, GEMINI_PATCH_REPAIR_ATTEMPTS + 1):
+        if ok:
+            break
+        build_errors = extract_compiler_errors(build_output)
+        print(
+            f"Generated patch failed to compile; requesting repair "
+            f"({repair_attempt}/{GEMINI_PATCH_REPAIR_ATTEMPTS}).",
+            file=sys.stderr,
+        )
+        print(build_errors, file=sys.stderr)
+        for path in modified_paths:
+            print_file_head(path)
+
+        originals = {str(p): content for p, content in backups.items() if content is not None}
+        repaired = request_patch_repair(api_key, findings, originals, patched_files, build_errors)
+        repaired_files = repaired.get("patched_files", [])
+        if not repaired_files:
+            print("Repair response contained no patched files.", file=sys.stderr)
+            break
+        findings = repaired.get("findings") or findings
+        patched_files = repaired_files
+        modified_paths = list(dict.fromkeys(modified_paths + apply_patched_files(patched_files, backups)))
+        ok, build_output = verify_gradle_build()
+
     if not ok:
-        print("Generated patch failed to compile; restoring original files.", file=sys.stderr)
+        print("Generated patch failed to compile after repair attempts; restoring original files.", file=sys.stderr)
         print(build_output, file=sys.stderr)
-        for file_path, original in backups.items():
-            file_path.write_text(original, encoding="utf-8")
+        for path in modified_paths:
+            print_file_head(path)
+        restore_backups(backups)
         return 1
 
     cwes = [f.get("cwe", "CWE-940") for f in findings]
@@ -529,4 +657,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Keep stdout and stderr in order in CI logs.
+    sys.stdout.reconfigure(line_buffering=True)
     sys.exit(main())
