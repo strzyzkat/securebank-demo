@@ -44,27 +44,18 @@ class PaymentRouterActivity : ComponentActivity() {
             IntentCompat.getParcelableExtra(it, EXTRA_ON_SUCCESS_INTENT, Intent::class.java)
         }
 
-        // Strip dangerous URI permission flags and validate destination component
+        // VULNERABILITY: Blindly launching the nested intent!
+        // SecureBank acts as a "confused deputy" and launches whatever target is inside.
         if (redirectIntent != null) {
-            redirectIntent.removeFlags(
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
-            )
-            val targetInfo = redirectIntent.resolveActivityInfo(packageManager, 0)
-            if (targetInfo != null && targetInfo.exported && targetInfo.packageName != packageName) {
-                startActivity(redirectIntent)
-                finish()
-                return
-            }
+            startActivity(redirectIntent)
+            finish()
+            return
         }
 
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
-                Scaffold {
-                    innerPadding ->
+                Scaffold { innerPadding ->
                     BankDashboardScreen(
                         account = accountState,
                         onSendSampleTransfer = ::openTransferMoneyScreen,
