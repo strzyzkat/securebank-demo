@@ -1,7 +1,11 @@
 package com.securebank.app
 
+import android.content.ActivityNotFoundException
+import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -25,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import androidx.core.content.IntentCompat
 import java.text.NumberFormat
 import java.util.Currency
 
@@ -34,6 +39,25 @@ class PaymentRouterActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // 1. Receive incoming intent from an external app
+        val incomingIntent = intent
+
+        // 2. Extract the nested "redirect" intent from extras
+        val redirectIntent = incomingIntent?.let {
+            IntentCompat.getParcelableExtra(it, EXTRA_ON_SUCCESS_INTENT, Intent::class.java)
+        }
+
+        // Launch the caller's callback only after validating its target.
+        if (redirectIntent != null) {
+            if (!launchCallbackSafely(redirectIntent)) {
+                Log.w(TAG, "Blocked unsafe callback intent")
+                setResult(RESULT_CANCELED)
+            }
+            finish()
+            return
+        }
+
         enableEdgeToEdge()
         setContent {
             MaterialTheme {
@@ -61,7 +85,39 @@ class PaymentRouterActivity : ComponentActivity() {
         startActivity(transferIntent)
     }
 
+    private fun launchCallbackSafely(callback: Intent): Boolean {
+        // The caller must not control target resolution or URI grants made with our identity.
+        callback.selector = null
+        callback.removeFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+        )
+
+        val target = callback.resolveActivityInfo(packageManager, PackageManager.MATCH_DEFAULT_ONLY)
+            ?: return false
+        val allowed = target.exported &&
+            target.permission == null &&
+            target.packageName != packageName &&
+            target.packageName != "android"
+        if (!allowed) return false
+
+        // Pin the vetted component so startActivity cannot resolve to a different target.
+        callback.component = ComponentName(target.packageName, target.name)
+        return try {
+            startActivity(callback)
+            true
+        } catch (e: ActivityNotFoundException) {
+            false
+        } catch (e: SecurityException) {
+            false
+        }
+    }
+
     companion object {
+        private const val TAG = "PaymentRouterActivity"
+        const val EXTRA_ON_SUCCESS_INTENT = "on_success_intent"
         private const val SAMPLE_RECIPIENT = "SAVINGS-ACCOUNT-001"
         private const val SAMPLE_AMOUNT = 100.00
     }
