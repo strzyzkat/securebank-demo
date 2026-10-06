@@ -137,7 +137,11 @@ SECURITY_GUARDS: list[SecurityGuard] = [
             "after the target passes validation.\n"
             "   7. When blocked, fail closed without crashing: log a warning, setResult(RESULT_CANCELED), "
             "and finish(). Do not throw an exception and do not launch any part of the nested Intent.\n"
-            "   8. Add the required imports and a TAG constant. Do not reformat unrelated code."
+            "   8. Add the required imports and a TAG constant. Do not reformat unrelated code.\n"
+            "   9. Remove or rewrite comments next to the patched code that describe the old vulnerable "
+            "behavior (for example, \"VULNERABILITY: Blindly launching the nested intent!\" or "
+            "\"confused deputy\" notes). Replace them with one short comment describing the safe "
+            "behavior, such as \"// Launch the caller's callback only after validating its target.\""
         ),
         reference_implementation=INTENT_REDIRECTION_REFERENCE,
     ),
@@ -297,6 +301,7 @@ Review the Pull Request diff alongside the Semgrep static pre-filter signals, An
    - Populate `patched_files` with the complete, compilable file content for every file that needs modification to fix all findings.
    - Preserve all existing package declarations, imports, UI composables, and helper methods so `./gradlew :app:compileDebugKotlin :app:testDebugUnitTest` succeeds without errors.
    - Each `content` value must be the raw source file: real newlines, `package` declaration first, one `import` per line, no markdown code fences, no line numbers.
+   - Remove or rewrite comments next to the code you patch that describe the old vulnerable behavior (for example, lines starting with "VULNERABILITY:"). Keep all other comments unchanged.
 3. If no guard is violated, set `vulnerable` to `false` and return empty arrays for `findings` and `patched_files`.
 
 --- STEP 1: SEMGREP STATIC PRE-FILTER FINDINGS ---
@@ -425,6 +430,7 @@ Rules:
 - Start each Kotlin file with its `package` declaration, followed by one `import` per line.
 - Keep every import, class, composable, and helper from the original file unless the fix requires changing it.
 - Change only what is needed to fix the security findings and the compiler errors. Do not drop any security check to make the code compile.
+- Remove or rewrite comments next to the patched code that describe the old vulnerable behavior (for example, lines starting with "VULNERABILITY:"). Keep all other comments unchanged.
 
 --- KOTLIN COMPILER ERRORS ---
 {build_errors}
