@@ -49,6 +49,58 @@ class SecurityGuard:
     title: str
     detection_criteria: str
     remediation_strategy: str
+    # Optional code the model should follow when generating the patch.
+    reference_implementation: str = ""
+
+
+INTENT_REDIRECTION_REFERENCE = """\
+// In onCreate: handle the nested callback Intent only after the activity's own work succeeds.
+val callbackIntent = IntentCompat.getParcelableExtra(intent, EXTRA_ON_SUCCESS_INTENT, Intent::class.java)
+if (callbackIntent != null) {
+    if (!launchCallbackSafely(callbackIntent)) {
+        Log.w(TAG, "Blocked unsafe callback intent")
+        setResult(RESULT_CANCELED)
+    }
+    finish()
+    return
+}
+
+// Launches the callback only if it targets a public activity in another app.
+private fun launchCallbackSafely(callback: Intent): Boolean {
+    // The caller must not control target resolution or URI grants made with our identity.
+    callback.selector = null
+    callback.removeFlags(
+        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+    )
+
+    val target = callback.resolveActivityInfo(packageManager, PackageManager.MATCH_DEFAULT_ONLY)
+        ?: return false
+    val allowed = target.exported &&
+        target.permission == null &&
+        target.packageName != packageName &&
+        target.packageName != "android"
+    if (!allowed) return false
+
+    // Pin the vetted component so startActivity cannot resolve to a different target.
+    callback.component = ComponentName(target.packageName, target.name)
+    return try {
+        startActivity(callback)
+        true
+    } catch (e: ActivityNotFoundException) {
+        false
+    } catch (e: SecurityException) {
+        false
+    }
+}
+
+// companion object additions:
+// private const val TAG = "PaymentRouterActivity"
+// Required imports: android.content.ActivityNotFoundException, android.content.ComponentName,
+// android.content.pm.PackageManager, android.util.Log
+"""
 
 
 # Registry of security guards. Add new SecurityGuard entries here to extend coverage.
@@ -62,19 +114,32 @@ SECURITY_GUARDS: list[SecurityGuard] = [
             "Intent from incoming extras (e.g., getParcelableExtra, IntentCompat.getParcelableExtra, "
             "or Bundle.getParcelable) and passes it to startActivity, startActivities, "
             "startActivityForResult, startService, startForegroundService, bindService, or "
-            "sendBroadcast without verifying the destination component or stripping URI grant flags."
+            "sendBroadcast. Treat the code as vulnerable unless ALL of these hold before launch: "
+            "(a) the selector is cleared; (b) all four FLAG_GRANT_*_URI_PERMISSION flags are removed; "
+            "(c) the target is resolved with PackageManager.MATCH_DEFAULT_ONLY; "
+            "(d) the resolved target is exported, has no android:permission, is not in this app's "
+            "package, and is not the system resolver/chooser (package \"android\"); "
+            "(e) the Intent's component is pinned to the vetted ComponentName before launch. "
+            "A partial check (for example, only exported and package checks) is still a violation."
         ),
         remediation_strategy=(
-            "1. Strip dangerous URI permission flags on the nested Intent using "
-            "redirectIntent.removeFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or "
-            "Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or "
-            "Intent.FLAG_GRANT_PREFIX_URI_PERMISSION).\n"
-            "2. Resolve the target component using "
-            "val targetInfo = redirectIntent.resolveActivityInfo(packageManager, 0) and only launch "
-            "redirectIntent when targetInfo != null && targetInfo.exported && "
-            "targetInfo.packageName != packageName, blocking access to internal or non-exported "
-            "components."
+            "Follow the reference implementation and adapt names to the existing code.\n"
+            "   1. Move the launch into a private helper (launchCallbackSafely) that returns Boolean.\n"
+            "   2. Clear the selector and remove FLAG_GRANT_READ/WRITE/PERSISTABLE/PREFIX_URI_PERMISSION.\n"
+            "   3. Resolve with resolveActivityInfo(packageManager, PackageManager.MATCH_DEFAULT_ONLY); "
+            "return false when null.\n"
+            "   4. Allow launch only when target.exported && target.permission == null && "
+            "target.packageName != packageName && target.packageName != \"android\".\n"
+            "   5. Pin callback.component = ComponentName(target.packageName, target.name), then call "
+            "startActivity inside try/catch for ActivityNotFoundException and SecurityException.\n"
+            "   6. If the activity performs an action first (for example, a payment), launch the callback "
+            "only after that action succeeds. Attach result extras (for example, payment status) only "
+            "after the target passes validation.\n"
+            "   7. When blocked, fail closed without crashing: log a warning, setResult(RESULT_CANCELED), "
+            "and finish(). Do not throw an exception and do not launch any part of the nested Intent.\n"
+            "   8. Add the required imports and a TAG constant. Do not reformat unrelated code."
         ),
+        reference_implementation=INTENT_REDIRECTION_REFERENCE,
     ),
     SecurityGuard(
         guard_id="pending-intent-mutability",
@@ -192,11 +257,14 @@ def load_semgrep_prefilter_summary(semgrep_path_str: str) -> str:
 def build_guards_prompt_section(guards: list[SecurityGuard]) -> str:
     blocks = []
     for idx, g in enumerate(guards, start=1):
-        blocks.append(
+        block = (
             f"{idx}. [{g.guard_id}] {g.cwe} - {g.title}\n"
             f"   Detection criteria: {g.detection_criteria}\n"
             f"   Required remediation strategy:\n   {g.remediation_strategy}"
         )
+        if g.reference_implementation:
+            block += f"\n   Reference implementation (Kotlin):\n```kotlin\n{g.reference_implementation}```"
+        blocks.append(block)
     return "\n\n".join(blocks)
 
 
@@ -340,17 +408,23 @@ def request_patch_repair(
     patched_section = "\n\n".join(
         f"--- FAILED PATCH: {item['path']} ---\n{item['content']}" for item in patched_files
     )
+    finding_ids = {f.get("guard_id") for f in findings}
+    relevant_guards = [g for g in SECURITY_GUARDS if g.guard_id in finding_ids] or SECURITY_GUARDS
+    guards_section = build_guards_prompt_section(relevant_guards)
     prompt = f"""You are fixing an Android Kotlin security patch that failed to compile.
 
 The previous patch addressed these findings:
 {json.dumps(findings, indent=2)}
+
+The corrected patch must still satisfy every step of these guards:
+{guards_section}
 
 Return corrected, complete, compilable file contents in `patched_files`, and repeat the same `findings` with `vulnerable` set to true.
 Rules:
 - Each `content` value must be the raw source file: real newlines, one statement per line, no markdown code fences, no line numbers.
 - Start each Kotlin file with its `package` declaration, followed by one `import` per line.
 - Keep every import, class, composable, and helper from the original file unless the fix requires changing it.
-- Change only what is needed to fix the security findings and the compiler errors.
+- Change only what is needed to fix the security findings and the compiler errors. Do not drop any security check to make the code compile.
 
 --- KOTLIN COMPILER ERRORS ---
 {build_errors}
