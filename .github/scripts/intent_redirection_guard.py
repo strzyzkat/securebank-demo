@@ -195,22 +195,22 @@ def call_gemini(
     )
     guards_section = build_guards_prompt_section(guards)
 
-    prompt = f"""You are an automated Android application security gate in a CI/CD pipeline.
-Evaluate the Pull Request diff alongside the Semgrep static pre-filter signals, AndroidManifest.xml, and the application source files against the registered security guards below.
+    prompt = f"""You are an automated Android static code analysis and defensive remediation tool in a CI/CD pipeline.
+Review the Pull Request diff alongside the Semgrep static pre-filter signals, AndroidManifest.xml, and the application source files against the registered defensive coding guards below.
 
-=== REGISTERED SECURITY GUARDS ===
+=== REGISTERED DEFENSIVE GUARDS ===
 {guards_section}
 
 === INSTRUCTIONS ===
-1. Review the Semgrep static pre-filter findings and correlate the PR diff with AndroidManifest.xml and all application source files. Look at how exported components interact with non-exported components (such as `TransferMoneyActivity`).
+1. Review the Semgrep static pre-filter findings and correlate the PR diff with AndroidManifest.xml and all application source files. Check how exported components interact with non-exported components (such as `TransferMoneyActivity`).
 2. If one or more guards are violated by the code in this PR:
    - Set `vulnerable` to `true`.
    - Populate `findings` with one entry per violated guard, explaining clearly:
-     * `why_dangerous`: How an attacker or external app can exploit the vulnerability in this codebase.
-     * `how_patched`: How the generated patch neutralizes the attack vector.
+     * `why_dangerous`: Why the unverified dataflow violates Android component isolation in this codebase.
+     * `how_patched`: How the generated defensive patch validates the target component and neutralizes the risk.
    - Populate `patched_files` with the complete, compilable file content for every file that needs modification to fix all findings.
    - Preserve all existing package declarations, imports, UI composables, and helper methods so `./gradlew :app:compileDebugKotlin :app:testDebugUnitTest` succeeds without errors.
-3. If no security guard is violated, set `vulnerable` to `false` and return empty arrays for `findings` and `patched_files`.
+3. If no guard is violated, set `vulnerable` to `false` and return empty arrays for `findings` and `patched_files`.
 
 --- STEP 1: SEMGREP STATIC PRE-FILTER FINDINGS ---
 {semgrep_summary}
@@ -227,6 +227,12 @@ Evaluate the Pull Request diff alongside the Semgrep static pre-filter signals, 
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        ],
         "generationConfig": {
             "temperature": 0.1,
             "responseMimeType": "application/json",
@@ -287,7 +293,17 @@ Evaluate the Pull Request diff alongside the Semgrep static pre-filter signals, 
         print(f"Gemini API error on model '{GEMINI_MODEL}' (HTTP {exc.code}): {err_body}", file=sys.stderr)
         raise
 
-    text = body["candidates"][0]["content"]["parts"][0]["text"]
+    candidates = body.get("candidates")
+    if not candidates:
+        print(f"Unexpected Gemini API response (no candidates): {json.dumps(body, indent=2)}", file=sys.stderr)
+        raise RuntimeError(f"Gemini returned no candidates: {body.get('promptFeedback', body)}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    if not parts or "text" not in parts[0]:
+        print(f"Unexpected Gemini candidate structure: {json.dumps(candidates[0], indent=2)}", file=sys.stderr)
+        raise RuntimeError(f"Gemini candidate had no text part (finishReason={candidates[0].get('finishReason')})")
+
+    text = parts[0]["text"]
     return json.loads(text)
 
 

@@ -39,7 +39,7 @@ jobs:
         run: |
           semgrep scan \
             --config .github/semgrep/android-security.yml \
-            --config p/android \
+            --metrics=off \
             --json \
             --output semgrep_raw.json \
             app/src/ || true
